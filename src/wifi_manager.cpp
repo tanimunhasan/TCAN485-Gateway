@@ -49,6 +49,10 @@ bool WifiManager::isConnected() const {
   return connected_;
 }
 
+int32_t WifiManager::rssi() const {
+  return connected_ ? WiFi.RSSI() : 0;
+}
+
 void WifiManager::startConnection() {
   lastConnectionAttemptMs_ = millis();
   Serial.print("Connecting to Wi-Fi network: ");

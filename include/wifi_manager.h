@@ -8,6 +8,7 @@ class WifiManager {
   void service();
 
   bool isConnected() const;
+  int32_t rssi() const;
 
  private:
   void startConnection();

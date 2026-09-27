@@ -3,11 +3,15 @@
 #include <Arduino.h>
 
 #include "rs485_transport.h"
+class ControllerCommandSender;
+class LegacyUplinkFormatter;
 class UdpForwarder;
 
 class Terminal {
  public:
-  Terminal(Rs485Transport &rs485, UdpForwarder &udpForwarder);
+  Terminal(Rs485Transport &rs485, ControllerCommandSender &controller,
+           UdpForwarder &udpForwarder,
+           LegacyUplinkFormatter &legacyFormatter);
 
   void begin();
   void service();
@@ -40,13 +44,14 @@ class Terminal {
   const char *lineEndingName() const;
 
   Rs485Transport &rs485_;
+  ControllerCommandSender &controller_;
   UdpForwarder &udpForwarder_;
+  LegacyUplinkFormatter &legacyFormatter_;
   char input_[kInputCapacity]{};
   size_t inputLength_{0};
   bool inputOverflow_{false};
   char previousTerminator_{'\0'};
   LineEnding lineEnding_{LineEnding::CRLF};
-  uint8_t destinationAddress_{0x01};
   uint8_t receiveBuffer_[kReceiveBufferCapacity]{};
   size_t receiveLength_{0};
   bool receiveOverflow_{false};

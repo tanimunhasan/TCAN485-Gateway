@@ -1,5 +1,7 @@
 #include "terminal.h"
+#include "controller_command_sender.h"
 #include "controller_protocol.h"
+#include "legacy_uplink_formatter.h"
 #include "udp_forwarder.h"
 
 #include <cctype>
@@ -74,8 +76,13 @@ bool parseAddress(const char *text, uint8_t &address) {
 
 }  // namespace
 
-Terminal::Terminal(Rs485Transport &rs485, UdpForwarder &udpForwarder)
-    : rs485_(rs485), udpForwarder_(udpForwarder) {}
+Terminal::Terminal(Rs485Transport &rs485, ControllerCommandSender &controller,
+                   UdpForwarder &udpForwarder,
+                   LegacyUplinkFormatter &legacyFormatter)
+    : rs485_(rs485),
+      controller_(controller),
+      udpForwarder_(udpForwarder),
+      legacyFormatter_(legacyFormatter) {}
 
 void Terminal::begin() {
   Serial.begin(kUsbBaud);
@@ -124,11 +131,26 @@ void Terminal::serviceUdpForwarder() {
   if (receiveOverflow_) {
     Serial.println("\nUDP forwarding skipped: RS485 response exceeded buffer.");
   } else {
-    udpForwarder_.send(receiveBuffer_, receiveLength_);
+    char formatted[LegacyUplinkFormatter::kMaxPayloadLength];
+    size_t formattedLength = 0;
+    const char *detail = nullptr;
+    const UplinkFormatResult result =
+        legacyFormatter_.format(receiveBuffer_, receiveLength_, formatted,
+                                sizeof(formatted), formattedLength, detail);
+    if (result == UplinkFormatResult::Formatted) {
+      udpForwarder_.send(reinterpret_cast<const uint8_t *>(formatted),
+                         formattedLength);
+    } else if (legacyFormatter_.forwardRawDiagnostics()) {
+      udpForwarder_.send(receiveBuffer_, receiveLength_);
+    } else if (result == UplinkFormatResult::Rejected ||
+               result == UplinkFormatResult::TimeNotReady) {
+      Serial.printf("\nCloud forwarding skipped: %s.\n", detail);
+    }
   }
 
   receiveLength_ = 0;
   receiveOverflow_ = false;
+  controller_.completeResponse();
 }
 
 void Terminal::serviceConsole() {
@@ -209,8 +231,9 @@ void Terminal::processLine() {
     if (!parseAddress(argument, address)) {
       Serial.println("Invalid address. Use hexadecimal, e.g. /addr 01.");
     } else {
-      destinationAddress_ = address;
-      Serial.printf("Controller destination: %02X\n", destinationAddress_);
+      controller_.setDestinationAddress(address);
+      Serial.printf("Controller destination: %02X\n",
+                    controller_.destinationAddress());
     }
   } else if (startsWithCommand(command, "baud", argument) && *argument != '\0') {
     errno = 0;
@@ -254,18 +277,7 @@ void Terminal::sendText(const char *text) {
   rs485_.flush();
 }
 void Terminal::sendControllerCommand(const char *command) {
-  char frame[ControllerProtocol::kMaxFrameLength];
-  if (!ControllerProtocol::buildFrame(destinationAddress_, command, frame,
-                                      sizeof(frame))) {
-    Serial.println("Invalid controller command. Use /commands for valid codes.");
-    return;
-  }
-
-  const size_t frameLength = strlen(frame);
-  rs485_.write(reinterpret_cast<const uint8_t *>(frame), frameLength);
-  rs485_.flush();
-  Serial.print("TX: ");
-  Serial.print(frame);
+  controller_.send(command);
 }
 
 void Terminal::sendHex(const char *text) {
@@ -317,7 +329,8 @@ void Terminal::printHelp() const {
 void Terminal::printStatus() const {
   Serial.printf("USB monitor: %lu baud\n", static_cast<unsigned long>(kUsbBaud));
   Serial.printf("RS485: %lu baud, 8N1; controller address: %02X; text ending: %s\n",
-                static_cast<unsigned long>(rs485_.baud()), destinationAddress_,
+                static_cast<unsigned long>(rs485_.baud()),
+                controller_.destinationAddress(),
                 lineEndingName());
 }
 
