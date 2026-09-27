@@ -1,4 +1,6 @@
 #include "terminal.h"
+#include "controller_protocol.h"
+#include "udp_forwarder.h"
 
 #include <cctype>
 #include <cerrno>
@@ -54,10 +56,26 @@ bool parseHexByte(const char *&cursor, uint8_t &value) {
   cursor = end;
   return true;
 }
+bool parseAddress(const char *text, uint8_t &address) {
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long parsed = strtoul(text, &end, 16);
+  while (end != nullptr && std::isspace(static_cast<unsigned char>(*end))) {
+    ++end;
+  }
+  if (errno != 0 || end == text || (end != nullptr && *end != '\0') ||
+      parsed > 0xFF) {
+    return false;
+  }
+
+  address = static_cast<uint8_t>(parsed);
+  return true;
+}
 
 }  // namespace
 
-Terminal::Terminal(Rs485Transport &rs485) : rs485_(rs485) {}
+Terminal::Terminal(Rs485Transport &rs485, UdpForwarder &udpForwarder)
+    : rs485_(rs485), udpForwarder_(udpForwarder) {}
 
 void Terminal::begin() {
   Serial.begin(kUsbBaud);
@@ -68,7 +86,7 @@ void Terminal::begin() {
   Serial.printf("USB monitor: %lu baud | RS485: %lu baud, 8N1\n",
                 static_cast<unsigned long>(kUsbBaud),
                 static_cast<unsigned long>(rs485_.baud()));
-  Serial.println("Type text and press Enter to send it to RS485.");
+  Serial.println("Type a controller command such as A=? or P=? and press Enter.");
   Serial.println("Backspace/Delete removes one character; Ctrl+U clears the line.");
   Serial.println("Type /help for local terminal commands.");
   Serial.print("> ");
@@ -76,6 +94,7 @@ void Terminal::begin() {
 
 void Terminal::service() {
   serviceRs485();
+  serviceUdpForwarder();
   serviceConsole();
 }
 
@@ -86,8 +105,30 @@ void Terminal::serviceRs485() {
       // This intentionally writes raw data so the monitor behaves like a
       // normal serial terminal and shows exactly what arrived from RS485.
       Serial.write(static_cast<uint8_t>(received));
+      if (receiveLength_ < sizeof(receiveBuffer_)) {
+        receiveBuffer_[receiveLength_++] = static_cast<uint8_t>(received);
+      } else {
+        receiveOverflow_ = true;
+      }
+      lastReceiveByteMs_ = millis();
     }
   }
+}
+
+void Terminal::serviceUdpForwarder() {
+  if (receiveLength_ == 0 ||
+      static_cast<uint32_t>(millis() - lastReceiveByteMs_) < kReceiveGapMs) {
+    return;
+  }
+
+  if (receiveOverflow_) {
+    Serial.println("\nUDP forwarding skipped: RS485 response exceeded buffer.");
+  } else {
+    udpForwarder_.send(receiveBuffer_, receiveLength_);
+  }
+
+  receiveLength_ = 0;
+  receiveOverflow_ = false;
 }
 
 void Terminal::serviceConsole() {
@@ -139,6 +180,10 @@ void Terminal::processLine() {
   const char *argument = nullptr;
 
   if (input_[0] != '/') {
+    if (ControllerProtocol::isControllerCommand(input_)) {
+      sendControllerCommand(input_);
+      return;
+    }
     sendText(input_);
     return;
   }
@@ -149,10 +194,24 @@ void Terminal::processLine() {
   } else if (startsWithCommand(command, "status", argument) &&
              *argument == '\0') {
     printStatus();
+  } else if (startsWithCommand(command, "commands", argument) &&
+             *argument == '\0') {
+    printControllerCommands();
   } else if (startsWithCommand(command, "send", argument) && *argument != '\0') {
     sendText(argument);
   } else if (startsWithCommand(command, "hex", argument) && *argument != '\0') {
     sendHex(argument);
+  } else if (startsWithCommand(command, "cmd", argument) && *argument != '\0') {
+    sendControllerCommand(argument);
+  } else if (startsWithCommand(command, "addr", argument) &&
+             *argument != '\0') {
+    uint8_t address = 0;
+    if (!parseAddress(argument, address)) {
+      Serial.println("Invalid address. Use hexadecimal, e.g. /addr 01.");
+    } else {
+      destinationAddress_ = address;
+      Serial.printf("Controller destination: %02X\n", destinationAddress_);
+    }
   } else if (startsWithCommand(command, "baud", argument) && *argument != '\0') {
     errno = 0;
     char *end = nullptr;
@@ -194,6 +253,20 @@ void Terminal::sendText(const char *text) {
   writeLineEnding();
   rs485_.flush();
 }
+void Terminal::sendControllerCommand(const char *command) {
+  char frame[ControllerProtocol::kMaxFrameLength];
+  if (!ControllerProtocol::buildFrame(destinationAddress_, command, frame,
+                                      sizeof(frame))) {
+    Serial.println("Invalid controller command. Use /commands for valid codes.");
+    return;
+  }
+
+  const size_t frameLength = strlen(frame);
+  rs485_.write(reinterpret_cast<const uint8_t *>(frame), frameLength);
+  rs485_.flush();
+  Serial.print("TX: ");
+  Serial.print(frame);
+}
 
 void Terminal::sendHex(const char *text) {
   const char *cursor = text;
@@ -225,11 +298,16 @@ void Terminal::sendHex(const char *text) {
 }
 
 void Terminal::printHelp() const {
-  Serial.println("Normal text is sent to RS485 when Enter is pressed.");
+  Serial.println("Type a controller command such as A=? or P=? and press Enter.");
+  Serial.println("The terminal builds @address#CMD=value*checksum\\r\\n automatically.");
+  Serial.println("Other text is sent unchanged to RS485 when Enter is pressed.");
   Serial.println("Backspace/Delete removes one typed character; Ctrl+U clears all.");
   Serial.println("Local commands:");
   Serial.println("  /help                   Show this help");
   Serial.println("  /status                 Show RS485 configuration");
+  Serial.println("  /commands               List declared controller commands");
+  Serial.println("  /addr <hex>             Select controller address, e.g. /addr 01");
+  Serial.println("  /cmd <CMD=value>        Explicitly send a controller command");
   Serial.println("  /send <text>            Send text that begins with /");
   Serial.println("  /hex <bytes>            Send exact bytes, e.g. /hex 48 69 0D 0A");
   Serial.println("  /ending none|cr|lf|crlf Set suffix for normal text (default: crlf)");
@@ -238,8 +316,19 @@ void Terminal::printHelp() const {
 
 void Terminal::printStatus() const {
   Serial.printf("USB monitor: %lu baud\n", static_cast<unsigned long>(kUsbBaud));
-  Serial.printf("RS485: %lu baud, 8N1; text ending: %s\n",
-                static_cast<unsigned long>(rs485_.baud()), lineEndingName());
+  Serial.printf("RS485: %lu baud, 8N1; controller address: %02X; text ending: %s\n",
+                static_cast<unsigned long>(rs485_.baud()), destinationAddress_,
+                lineEndingName());
+}
+
+void Terminal::printControllerCommands() const {
+  Serial.println("Declared controller commands:");
+  for (size_t index = 0; index < ControllerProtocol::kCommandCount; ++index) {
+    const ControllerProtocol::CommandDefinition &command =
+        ControllerProtocol::kCommands[index];
+    Serial.printf("  %c  %-10s %s\n", command.code, command.name,
+                  command.description);
+  }
 }
 
 void Terminal::eraseLastCharacter() {
