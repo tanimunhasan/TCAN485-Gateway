@@ -19,5 +19,8 @@ extern const size_t kCommandCount;
 bool isControllerCommand(const char *command);
 bool buildFrame(uint8_t address, const char *command, char *frame,
                 size_t frameCapacity);
+bool parseResponseFrame(const uint8_t *frame, size_t frameLength,
+                        uint8_t expectedAddress, const uint8_t *&payload,
+                        size_t &payloadLength);
 
 }  // namespace ControllerProtocol

@@ -128,8 +128,15 @@ void Terminal::serviceUdpForwarder() {
     return;
   }
 
+  const char activeCommandCode = controller_.activeCommandCode();
+  const bool isControllerControlResponse =
+      controller_.isAwaitingResponse() &&
+      (activeCommandCode == 'R' || activeCommandCode == 'T');
+
   if (receiveOverflow_) {
     Serial.println("\nUDP forwarding skipped: RS485 response exceeded buffer.");
+  } else if (isControllerControlResponse) {
+    Serial.println("\nController management response received locally.");
   } else {
     char formatted[LegacyUplinkFormatter::kMaxPayloadLength];
     size_t formattedLength = 0;
@@ -148,9 +155,10 @@ void Terminal::serviceUdpForwarder() {
     }
   }
 
+  controller_.completeResponse(receiveBuffer_, receiveLength_,
+                               receiveOverflow_);
   receiveLength_ = 0;
   receiveOverflow_ = false;
-  controller_.completeResponse();
 }
 
 void Terminal::serviceConsole() {

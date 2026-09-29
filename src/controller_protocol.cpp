@@ -39,6 +39,26 @@ uint8_t checksum(const char *text) {
   return value;
 }
 
+uint8_t hexNibble(uint8_t value) {
+  if (value >= '0' && value <= '9') {
+    return static_cast<uint8_t>(value - '0');
+  }
+  return static_cast<uint8_t>(
+      std::toupper(static_cast<unsigned char>(value)) - 'A' + 10);
+}
+
+uint8_t decodeHexByte(uint8_t high, uint8_t low) {
+  return static_cast<uint8_t>((hexNibble(high) << 4) | hexNibble(low));
+}
+
+uint8_t checksum(const uint8_t *data, size_t length) {
+  uint8_t value = 0;
+  while (length-- > 0) {
+    value = static_cast<uint8_t>(value + *data++);
+  }
+  return value;
+}
+
 bool isKnownCode(char code) {
   for (size_t index = 0; index < kCommandCount; ++index) {
     if (kCommands[index].code == code) {
@@ -81,6 +101,40 @@ bool buildFrame(uint8_t address, const char *command, char *frame,
                               address, normalizedCommand,
                               checksum(normalizedCommand));
   return length > 0 && static_cast<size_t>(length) < frameCapacity;
+}
+
+bool parseResponseFrame(const uint8_t *frame, size_t frameLength,
+                        uint8_t expectedAddress, const uint8_t *&payload,
+                        size_t &payloadLength) {
+  constexpr size_t kHeaderLength = 4;
+  constexpr size_t kTrailerLength = 5;
+
+  payload = nullptr;
+  payloadLength = 0;
+  if (frame == nullptr || frameLength < kHeaderLength + kTrailerLength ||
+      frame[0] != '@' || frame[3] != '#' ||
+      !std::isxdigit(frame[1]) || !std::isxdigit(frame[2])) {
+    return false;
+  }
+
+  const size_t checksumIndex = frameLength - kTrailerLength;
+  if (frame[checksumIndex] != '*' ||
+      !std::isxdigit(frame[checksumIndex + 1]) ||
+      !std::isxdigit(frame[checksumIndex + 2]) ||
+      frame[checksumIndex + 3] != '\r' || frame[checksumIndex + 4] != '\n') {
+    return false;
+  }
+
+  const uint8_t address = decodeHexByte(frame[1], frame[2]);
+  if (address != expectedAddress) {
+    return false;
+  }
+
+  payload = frame + kHeaderLength;
+  payloadLength = checksumIndex - kHeaderLength;
+  const uint8_t receivedChecksum =
+      decodeHexByte(frame[checksumIndex + 1], frame[checksumIndex + 2]);
+  return receivedChecksum == checksum(payload, payloadLength);
 }
 
 }  // namespace ControllerProtocol
