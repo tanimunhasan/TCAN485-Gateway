@@ -12,8 +12,7 @@
 
 namespace {
 
-constexpr uint8_t kFirstPageSize = AUTONOMOUS_FIRST_PAGE_SIZE;
-constexpr uint8_t kMaxPageSize = AUTONOMOUS_MAX_PAGE_SIZE;
+constexpr uint8_t kLogPageSize = AUTONOMOUS_LOG_PAGE_SIZE;
 constexpr uint32_t kIntervalMs = AUTONOMOUS_INTERVAL_MS;
 constexpr uint32_t kResponseTimeoutMs = AUTONOMOUS_RESPONSE_TIMEOUT_MS;
 constexpr uint32_t kControllerRetryMs = AUTONOMOUS_CONTROLLER_RETRY_MS;
@@ -25,9 +24,8 @@ constexpr uint32_t kDegradedRetryMs = AUTONOMOUS_DEGRADED_RETRY_MS;
 constexpr uint8_t kLogFailuresBeforeAudit =
     AUTONOMOUS_LOG_FAILURES_BEFORE_AUDIT;
 
-static_assert(kFirstPageSize >= 1 && kFirstPageSize <= kMaxPageSize,
-              "Autonomous page size range is invalid");
-static_assert(kMaxPageSize <= 25, "Controller supports at most 25 log records");
+static_assert(kLogPageSize >= 1 && kLogPageSize <= 25,
+              "Controller supports a log page size from 1 to 25");
 static_assert(kControllerMaxAttempts >= 1,
               "Controller maintenance needs at least one attempt");
 static_assert(kLogFailuresBeforeAudit >= 1,
@@ -38,14 +36,13 @@ static_assert(kLogFailuresBeforeAudit >= 1,
 AutonomousPoller::AutonomousPoller(ControllerCommandSender &controller,
                                    const WifiManager &wifi,
                                    const ClockService &clock)
-    : controller_(controller), wifi_(wifi), clock_(clock),
-      pageSize_(kFirstPageSize) {}
+    : controller_(controller), wifi_(wifi), clock_(clock) {}
 
 void AutonomousPoller::begin() {
   lastDispatchMs_ = millis();
   Serial.printf(
-      "Firmware mode: autonomous. Polling L=1h through L=%uh every %lu ms.\n",
-      kMaxPageSize, static_cast<unsigned long>(kIntervalMs));
+      "Firmware mode: autonomous. Polling fixed L=%uh every %lu ms.\n",
+      kLogPageSize, static_cast<unsigned long>(kIntervalMs));
   Serial.println(
       "Production controller supervision: enforce R=3, then synchronize UTC.");
 }
@@ -121,12 +118,6 @@ void AutonomousPoller::printWaitReason(WaitReason reason) {
   } else if (reason == WaitReason::Time) {
     Serial.println("Autonomous polling is waiting for NTP UTC time.");
   }
-}
-
-void AutonomousPoller::advancePageSize() {
-  pageSize_ = pageSize_ == kMaxPageSize
-                  ? kFirstPageSize
-                  : static_cast<uint8_t>(pageSize_ + 1);
 }
 
 void AutonomousPoller::beginModeAudit(uint32_t now, const char *reason) {
@@ -384,7 +375,6 @@ void AutonomousPoller::serviceLogPolling(uint32_t now) {
     }
 
     consecutiveLogFailures_ = 0;
-    advancePageSize();
     return;
   }
 
@@ -394,7 +384,7 @@ void AutonomousPoller::serviceLogPolling(uint32_t now) {
   }
 
   char command[8];
-  snprintf(command, sizeof(command), "L=%uh", pageSize_);
+  snprintf(command, sizeof(command), "L=%uh", kLogPageSize);
   if (controller_.send(command)) {
     logRequestPending_ = true;
     lastDispatchMs_ = now;

@@ -143,16 +143,14 @@ A non-empty response starts with:
 L,H,<actual-count>,...
 ```
 
-followed by either:
+followed by:
 
 ```text
 <column names>\r\n
 <52-character hex record>\r\n
 ```
 
-or directly by one or more 52-character hexadecimal records.
-
-The firmware validates the RS485 response frame and checksum, removes controller framing, ignores column names when present, and builds this plaintext legacy payload:
+The firmware validates the RS485 response frame and checksum, requires and removes the column-name line, removes controller framing, and builds this plaintext legacy payload:
 
 ```text
 IMEI,MsgIdx,08,SIM,RSSI C0<TimestampHex><CountHex><RecordHex...>
@@ -208,22 +206,50 @@ Upload:
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e esp32dev-autonomous -t upload --upload-port COM8
 ```
 
-The autonomous poller:
+The autonomous build treats `R=3` (`OPM_NORMAL`) as the required production
+controller mode. Its startup supervision sequence is:
 
-1. Waits for Wi-Fi and valid NTP UTC time.
-2. Waits for the configured interval.
-3. Sends `L=1h`, then `L=2h`, continuing through `L=25h`.
-4. Wraps back to `L=1h`.
-5. Waits for the controller response before issuing another request.
-6. Logs a timeout if no response completes within the configured response timeout.
+1. Send `R=?` and validate the addressed RS485 response and checksum.
+2. If the controller reports `R=3`, leave the running BabyBear, MummyBear, or
+   DaddyBear profile untouched.
+3. If the controller reports any other mode, including `R=0` (hibernate) or
+   `R=4` (test), send `R=3` once.
+4. Send `R=?` again and require confirmation of `R=3`.
+5. Once NTP UTC is valid, send `T=<epoch>` to set the controller RTC.
+6. Start periodic Manga log polling with a fixed `L=6h` request every ten
+   minutes. This requests up to six unread records in hexadecimal format.
+
+Controller management uses one RS485 transaction at a time. `R=` and `T=`
+responses are local control traffic and are never forwarded as cloud telemetry.
+Only valid `L=` response frames are eligible for legacy UDP formatting.
+Unsolicited RS485 bytes received while no controller command is pending are
+discarded silently and never passed to the cloud formatter.
+
+The production-mode audit repeats every 24 hours. It always queries `R=?`
+first and only sends `R=3` when the reported mode is not already normal. This
+avoids disturbing a controller that is independently running its selected gas
+cycle profile while still forcing test or hibernate modes back to production.
+
+Startup cannot block forever waiting for the controller. A mode audit gets
+three attempts with the configured response timeout and retry delay. If all
+attempts fail, log polling continues in degraded mode and the audit retries
+after five minutes. UTC synchronization failures also retry in the background.
+
+After two consecutive invalid or timed-out `L=` responses, the ESP32 starts a
+new `R=?` mode audit; it does not blindly send `R=3`. It continues using the
+same fixed `L=6h` request after recovery.
 
 The defaults in `include/autonomous_config.h` are:
 
 ```cpp
-#define AUTONOMOUS_INTERVAL_MS 10000UL
+#define AUTONOMOUS_INTERVAL_MS 600000UL
 #define AUTONOMOUS_RESPONSE_TIMEOUT_MS 8000UL
-#define AUTONOMOUS_FIRST_PAGE_SIZE 1
-#define AUTONOMOUS_MAX_PAGE_SIZE 25
+#define AUTONOMOUS_LOG_PAGE_SIZE 6
+#define AUTONOMOUS_CONTROLLER_RETRY_MS 5000UL
+#define AUTONOMOUS_CONTROLLER_MAX_ATTEMPTS 3
+#define AUTONOMOUS_MODE_AUDIT_INTERVAL_MS 86400000UL
+#define AUTONOMOUS_DEGRADED_RETRY_MS 300000UL
+#define AUTONOMOUS_LOG_FAILURES_BEFORE_AUDIT 2
 ```
 
 Override an autonomous build setting in `platformio.ini`:
@@ -233,10 +259,13 @@ Override an autonomous build setting in `platformio.ini`:
 extends = env:esp32dev
 build_flags =
   -DFIRMWARE_RUN_MODE=1
-  -DAUTONOMOUS_INTERVAL_MS=3600000UL
+  -DAUTONOMOUS_INTERVAL_MS=300000UL
+  -DAUTONOMOUS_LOG_PAGE_SIZE=9
 ```
 
-This example changes the poll interval to one hour. The `L=<count>h` number remains a requested record count, not a time duration.
+This example changes the poll interval to five minutes and requests up to nine
+unread hexadecimal log records per poll. The `L=<count>h` number remains a
+requested record count, not a time duration.
 
 ## Node-RED test
 
@@ -245,7 +274,7 @@ This example changes the poll interval to one hour. The `L=<count>h` number rema
 3. Configure the UDP node to output a string for readable legacy packets.
 4. Deploy the flow.
 5. Configure the ESP32 UDP host to the Node-RED server address and flash the firmware.
-6. Send a manual `L=1h` request or flash the autonomous build.
+6. Send a manual `L=6h` request or flash the autonomous build.
 
 Successful legacy telemetry begins with a value similar to:
 
@@ -259,14 +288,14 @@ Successful legacy telemetry begins with a value similar to:
 |---|---|
 | `src/main.cpp` | Application startup and main service loop |
 | `src/rs485_transport.cpp` | T-CAN485 transceiver and UART1 control |
-| `src/controller_command_sender.cpp` | RS485 command frame generation and transmit tracking |
-| `src/controller_protocol.cpp` | Controller command catalogue and checksum/frame construction |
-| `src/terminal.cpp` | USB terminal, manual commands, receive buffering, and diagnostics |
+| `src/controller_command_sender.cpp` | RS485 command transmission, active-command tracking, and validated response snapshots |
+| `src/controller_protocol.cpp` | Controller command catalogue, frame construction, and response address/checksum validation |
+| `src/terminal.cpp` | USB terminal, receive buffering, local control-response routing, and diagnostics |
 | `src/wifi_manager.cpp` | Wi-Fi station connection and reconnect behavior |
 | `src/clock_service.cpp` | NTP UTC synchronization |
 | `src/legacy_uplink_formatter.cpp` | RS485 Manga-page parsing and legacy packet formatting |
 | `src/udp_forwarder.cpp` | UDP datagram transmission |
-| `src/autonomous_poller.cpp` | Build-selected periodic `L=<count>h` scheduler |
+| `src/autonomous_poller.cpp` | Production mode supervision, UTC synchronization, recovery, and fixed `L=6h` scheduling |
 
 ## Build verification
 

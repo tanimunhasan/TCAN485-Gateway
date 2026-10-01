@@ -109,9 +109,6 @@ void Terminal::serviceRs485() {
   while (rs485_.available() > 0) {
     const int received = rs485_.read();
     if (received >= 0) {
-      // This intentionally writes raw data so the monitor behaves like a
-      // normal serial terminal and shows exactly what arrived from RS485.
-      Serial.write(static_cast<uint8_t>(received));
       if (receiveLength_ < sizeof(receiveBuffer_)) {
         receiveBuffer_[receiveLength_++] = static_cast<uint8_t>(received);
       } else {
@@ -128,15 +125,25 @@ void Terminal::serviceUdpForwarder() {
     return;
   }
 
+  // Only a response to a command sent through ControllerCommandSender belongs
+  // to the request/response protocol. Discard unsolicited UART noise or text
+  // silently instead of repeatedly presenting it to the cloud formatter.
+  if (!controller_.isAwaitingResponse()) {
+    receiveLength_ = 0;
+    receiveOverflow_ = false;
+    return;
+  }
+
+  // Preserve terminal visibility for solicited controller responses only.
+  Serial.write(receiveBuffer_, receiveLength_);
+
   const char activeCommandCode = controller_.activeCommandCode();
-  const bool isControllerControlResponse =
-      controller_.isAwaitingResponse() &&
-      (activeCommandCode == 'R' || activeCommandCode == 'T');
+  const bool isLogResponse = activeCommandCode == 'L';
 
   if (receiveOverflow_) {
     Serial.println("\nUDP forwarding skipped: RS485 response exceeded buffer.");
-  } else if (isControllerControlResponse) {
-    Serial.println("\nController management response received locally.");
+  } else if (!isLogResponse) {
+    Serial.println("\nController command response received locally.");
   } else {
     char formatted[LegacyUplinkFormatter::kMaxPayloadLength];
     size_t formattedLength = 0;
