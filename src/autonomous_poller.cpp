@@ -18,11 +18,14 @@ constexpr uint32_t kResponseTimeoutMs = AUTONOMOUS_RESPONSE_TIMEOUT_MS;
 constexpr uint32_t kControllerRetryMs = AUTONOMOUS_CONTROLLER_RETRY_MS;
 constexpr uint8_t kControllerMaxAttempts =
     AUTONOMOUS_CONTROLLER_MAX_ATTEMPTS;
-constexpr uint32_t kModeAuditIntervalMs =
-    AUTONOMOUS_MODE_AUDIT_INTERVAL_MS;
+constexpr uint32_t kHealthCheckIntervalMs =
+    AUTONOMOUS_HEALTH_CHECK_INTERVAL_MS;
 constexpr uint32_t kDegradedRetryMs = AUTONOMOUS_DEGRADED_RETRY_MS;
 constexpr uint8_t kLogFailuresBeforeAudit =
     AUTONOMOUS_LOG_FAILURES_BEFORE_AUDIT;
+constexpr uint32_t kMinValidEpoch = AUTONOMOUS_MIN_VALID_EPOCH;
+constexpr uint32_t kTimeDriftToleranceSec =
+    AUTONOMOUS_TIME_DRIFT_TOLERANCE_SEC;
 
 static_assert(kLogPageSize >= 1 && kLogPageSize <= 25,
               "Controller supports a log page size from 1 to 25");
@@ -43,8 +46,10 @@ void AutonomousPoller::begin() {
   Serial.printf(
       "Firmware mode: autonomous. Polling fixed L=%uh every %lu ms.\n",
       kLogPageSize, static_cast<unsigned long>(kIntervalMs));
-  Serial.println(
-      "Production controller supervision: enforce R=3, then synchronize UTC.");
+  Serial.printf(
+      "Production controller supervision: check R=3 every %lu seconds; "
+      "set UTC only after mode recovery.\n",
+      static_cast<unsigned long>(kHealthCheckIntervalMs / 1000UL));
 }
 
 void AutonomousPoller::service() {
@@ -64,10 +69,10 @@ void AutonomousPoller::service() {
     return;
   }
 
-  if (modeAuditIntervalMs_ > 0 &&
-      static_cast<uint32_t>(now - lastModeAuditMs_) >=
-          modeAuditIntervalMs_) {
-    beginModeAudit(now, "scheduled production-mode audit");
+  if (healthCheckIntervalMs_ > 0 &&
+      static_cast<uint32_t>(now - lastHealthCheckMs_) >=
+          healthCheckIntervalMs_) {
+    beginHealthCheck(now, "scheduled production health check");
     serviceControllerManagement(now);
     return;
   }
@@ -79,7 +84,7 @@ void AutonomousPoller::service() {
   if (timeSyncDue_ && modeConfirmedNormal_ && clock_.hasValidTime() &&
       timeRetryReady) {
     timeSyncBackoffActive_ = false;
-    modeAuditInProgress_ = false;
+    healthCheckInProgress_ = false;
     controllerState_ = ControllerState::NeedTimeSync;
     serviceControllerManagement(now);
     return;
@@ -120,15 +125,14 @@ void AutonomousPoller::printWaitReason(WaitReason reason) {
   }
 }
 
-void AutonomousPoller::beginModeAudit(uint32_t now, const char *reason) {
-  Serial.printf("Starting controller mode audit: %s.\n", reason);
+void AutonomousPoller::beginHealthCheck(uint32_t now, const char *reason) {
+  Serial.printf("Starting controller health check: %s.\n", reason);
   controllerState_ = ControllerState::NeedModeQuery;
   retryState_ = ControllerState::NeedModeQuery;
   controllerStateStartedMs_ = now;
-  modeAuditAttempts_ = 0;
-  modeAuditInProgress_ = true;
+  healthCheckAttempts_ = 0;
+  healthCheckInProgress_ = true;
   modeConfirmedNormal_ = false;
-  timeSyncDue_ = true;
 }
 
 void AutonomousPoller::serviceControllerManagement(uint32_t now) {
@@ -139,22 +143,22 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
 
   switch (controllerState_) {
     case ControllerState::NeedModeQuery:
-      ++modeAuditAttempts_;
+      ++healthCheckAttempts_;
       if (!controller_.send("R=?")) {
-        handleModeAuditFailure(now, "could not send R=?");
+        handleHealthCheckFailure(now, "could not send R=?");
         return;
       }
       controllerState_ = ControllerState::WaitModeQuery;
       controllerStateStartedMs_ = now;
       Serial.printf("Controller mode query attempt %u of %u.\n",
-                    modeAuditAttempts_, kControllerMaxAttempts);
+                    healthCheckAttempts_, kControllerMaxAttempts);
       return;
 
     case ControllerState::WaitModeQuery:
       if (controller_.isAwaitingResponse()) {
         if (responseTimedOut(now)) {
           controller_.cancelResponse();
-          handleModeAuditFailure(now, "R=? response timed out");
+          handleHealthCheckFailure(now, "R=? response timed out");
         }
         return;
       }
@@ -162,44 +166,52 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
               'R', payload, sizeof(payload), payloadLength,
               payloadTruncated) ||
           payloadTruncated || !parseOperationMode(payload, mode)) {
-        handleModeAuditFailure(now, "R=? response was invalid");
+        handleHealthCheckFailure(now, "R=? response was invalid");
         return;
       }
       if (mode == 3) {
-        Serial.println("Controller confirmed R=3 - OPM_NORMAL; mode unchanged.");
         modeConfirmedNormal_ = true;
-        if (clock_.hasValidTime()) {
-          controllerState_ = ControllerState::NeedTimeSync;
+        if (timeSyncDue_) {
+          Serial.println(
+              "Controller confirmed R=3 after mode recovery; UTC update is "
+              "still required.");
+          if (clock_.hasValidTime()) {
+            controllerState_ = ControllerState::NeedTimeSync;
+          } else {
+            Serial.println(
+                "Controller UTC update is pending until ESP32 NTP is valid.");
+            finishHealthCheck(now);
+          }
         } else {
-          finishModeAudit(now);
+          Serial.println(
+              "Controller confirmed R=3 - OPM_NORMAL; mode and UTC "
+              "unchanged.");
+          finishHealthCheck(now);
         }
       } else {
         Serial.printf(
-            "Controller reported R=%u; production policy requires R=3.\n",
+            "Controller reported R=%u; immediately sending R=3.\n",
             mode);
-        controllerState_ = ControllerState::NeedSetNormal;
+        timeSyncDue_ = true;
+        if (!controller_.send("R=3")) {
+          handleHealthCheckFailure(now, "could not send immediate R=3");
+          return;
+        }
+        controllerState_ = ControllerState::WaitSetNormal;
+        controllerStateStartedMs_ = now;
       }
-      return;
-
-    case ControllerState::NeedSetNormal:
-      if (!controller_.send("R=3")) {
-        handleModeAuditFailure(now, "could not send R=3");
-        return;
-      }
-      controllerState_ = ControllerState::WaitSetNormal;
-      controllerStateStartedMs_ = now;
       return;
 
     case ControllerState::WaitSetNormal:
       if (controller_.isAwaitingResponse()) {
         if (responseTimedOut(now)) {
           controller_.cancelResponse();
-          handleModeAuditFailure(now, "R=3 response timed out");
+          handleHealthCheckFailure(now, "R=3 response timed out");
         }
         return;
       }
       if (!controller_.takeCompletedResponse('R')) {
-        handleModeAuditFailure(now, "R=3 response was invalid");
+        handleHealthCheckFailure(now, "R=3 response was invalid");
         return;
       }
       controllerState_ = ControllerState::NeedModeConfirmation;
@@ -207,7 +219,7 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
 
     case ControllerState::NeedModeConfirmation:
       if (!controller_.send("R=?")) {
-        handleModeAuditFailure(now, "could not confirm R=3");
+        handleHealthCheckFailure(now, "could not confirm R=3");
         return;
       }
       controllerState_ = ControllerState::WaitModeConfirmation;
@@ -218,7 +230,7 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
       if (controller_.isAwaitingResponse()) {
         if (responseTimedOut(now)) {
           controller_.cancelResponse();
-          handleModeAuditFailure(now, "R=3 confirmation timed out");
+          handleHealthCheckFailure(now, "R=3 confirmation timed out");
         }
         return;
       }
@@ -226,23 +238,26 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
               'R', payload, sizeof(payload), payloadLength,
               payloadTruncated) ||
           payloadTruncated || !parseOperationMode(payload, mode) || mode != 3) {
-        handleModeAuditFailure(now,
-                               "controller did not confirm OPM_NORMAL");
+        handleHealthCheckFailure(now,
+                                 "controller did not confirm OPM_NORMAL");
         return;
       }
       Serial.println("Controller transition to R=3 - OPM_NORMAL confirmed.");
       modeConfirmedNormal_ = true;
+      timeSyncDue_ = true;
       if (clock_.hasValidTime()) {
         controllerState_ = ControllerState::NeedTimeSync;
       } else {
-        finishModeAudit(now);
+        Serial.println(
+            "Controller UTC update is pending until ESP32 NTP is valid.");
+        finishHealthCheck(now);
       }
       return;
 
     case ControllerState::NeedTimeSync: {
       if (!clock_.hasValidTime()) {
-        if (modeAuditInProgress_) {
-          finishModeAudit(now);
+        if (healthCheckInProgress_) {
+          finishHealthCheck(now);
         } else {
           controllerState_ = ControllerState::Ready;
         }
@@ -273,15 +288,56 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
         handleTimeSyncFailure(now, "T=<epoch> response was invalid");
         return;
       }
+      Serial.println(
+          "Controller accepted UTC synchronization; verifying with T=?.");
+      controllerState_ = ControllerState::NeedTimeConfirmation;
+      return;
+
+    case ControllerState::NeedTimeConfirmation:
+      if (!controller_.send("T=?")) {
+        handleTimeSyncFailure(now, "could not verify UTC with T=?");
+        return;
+      }
+      controllerState_ = ControllerState::WaitTimeConfirmation;
+      controllerStateStartedMs_ = now;
+      return;
+
+    case ControllerState::WaitTimeConfirmation: {
+      if (controller_.isAwaitingResponse()) {
+        if (responseTimedOut(now)) {
+          controller_.cancelResponse();
+          handleTimeSyncFailure(now, "UTC confirmation timed out");
+        }
+        return;
+      }
+
+      uint32_t controllerEpoch = 0;
+      if (!controller_.takeCompletedResponse(
+              'T', payload, sizeof(payload), payloadLength,
+              payloadTruncated) ||
+          payloadTruncated || !parseControllerEpoch(payload, controllerEpoch)) {
+        handleTimeSyncFailure(now, "UTC confirmation was invalid");
+        return;
+      }
+
+      const uint32_t gatewayEpoch = clock_.epoch();
+      const uint32_t drift = epochDifference(controllerEpoch, gatewayEpoch);
+      if (controllerEpoch < kMinValidEpoch ||
+          drift > kTimeDriftToleranceSec) {
+        handleTimeSyncFailure(
+            now, "controller UTC confirmation was outside tolerance");
+        return;
+      }
+
+      Serial.printf(
+          "Controller UTC synchronization confirmed: %lu (drift %lu s).\n",
+          static_cast<unsigned long>(controllerEpoch),
+          static_cast<unsigned long>(drift));
       timeSyncDue_ = false;
       timeSyncBackoffActive_ = false;
-      Serial.println("Controller accepted UTC synchronization.");
-      if (modeAuditInProgress_) {
-        finishModeAudit(now);
-      } else {
-        controllerState_ = ControllerState::Ready;
-      }
+      finishTimeCheck(now);
       return;
+    }
 
     case ControllerState::RetryDelay:
       if (static_cast<uint32_t>(now - controllerStateStartedMs_) >=
@@ -295,11 +351,11 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
   }
 }
 
-void AutonomousPoller::handleModeAuditFailure(uint32_t now,
-                                              const char *reason) {
-  if (modeAuditAttempts_ < kControllerMaxAttempts) {
+void AutonomousPoller::handleHealthCheckFailure(uint32_t now,
+                                                const char *reason) {
+  if (healthCheckAttempts_ < kControllerMaxAttempts) {
     Serial.printf(
-        "Controller mode audit failed: %s; retrying in %lu seconds.\n",
+        "Controller health check failed: %s; retrying in %lu seconds.\n",
         reason, static_cast<unsigned long>(kControllerRetryMs / 1000UL));
     retryState_ = ControllerState::NeedModeQuery;
     controllerState_ = ControllerState::RetryDelay;
@@ -308,15 +364,15 @@ void AutonomousPoller::handleModeAuditFailure(uint32_t now,
   }
 
   Serial.printf(
-      "Controller mode audit unavailable after %u attempts: %s. Log polling "
-      "will continue; mode audit retries in %lu seconds.\n",
+      "Controller health check unavailable after %u attempts: %s. Log "
+      "polling will continue; health check retries in %lu seconds.\n",
       kControllerMaxAttempts, reason,
       static_cast<unsigned long>(kDegradedRetryMs / 1000UL));
   modeConfirmedNormal_ = false;
-  modeAuditInProgress_ = false;
+  healthCheckInProgress_ = false;
   controllerState_ = ControllerState::Ready;
-  lastModeAuditMs_ = now;
-  modeAuditIntervalMs_ = kDegradedRetryMs;
+  lastHealthCheckMs_ = now;
+  healthCheckIntervalMs_ = kDegradedRetryMs;
   completeStartup(now);
 }
 
@@ -329,21 +385,29 @@ void AutonomousPoller::handleTimeSyncFailure(uint32_t now,
   timeSyncDue_ = true;
   timeSyncBackoffActive_ = true;
   lastTimeSyncFailureMs_ = now;
-  if (modeAuditInProgress_) {
-    finishModeAudit(now);
+  if (healthCheckInProgress_) {
+    finishHealthCheck(now);
   } else {
     controllerState_ = ControllerState::Ready;
   }
 }
 
-void AutonomousPoller::finishModeAudit(uint32_t now) {
+void AutonomousPoller::finishHealthCheck(uint32_t now) {
   controllerState_ = ControllerState::Ready;
-  modeAuditInProgress_ = false;
-  modeAuditAttempts_ = 0;
-  lastModeAuditMs_ = now;
-  modeAuditIntervalMs_ = kModeAuditIntervalMs;
+  healthCheckInProgress_ = false;
+  healthCheckAttempts_ = 0;
+  lastHealthCheckMs_ = now;
+  healthCheckIntervalMs_ = kHealthCheckIntervalMs;
   consecutiveLogFailures_ = 0;
   completeStartup(now);
+}
+
+void AutonomousPoller::finishTimeCheck(uint32_t now) {
+  if (healthCheckInProgress_) {
+    finishHealthCheck(now);
+  } else {
+    controllerState_ = ControllerState::Ready;
+  }
 }
 
 void AutonomousPoller::completeStartup(uint32_t now) {
@@ -398,7 +462,7 @@ void AutonomousPoller::handleLogFailure(uint32_t now, const char *reason) {
                 consecutiveLogFailures_, kLogFailuresBeforeAudit, reason);
   if (consecutiveLogFailures_ >= kLogFailuresBeforeAudit) {
     consecutiveLogFailures_ = 0;
-    beginModeAudit(now, "repeated log response failures");
+    beginHealthCheck(now, "repeated log response failures");
   }
 }
 
@@ -427,4 +491,31 @@ bool AutonomousPoller::parseOperationMode(const char *payload,
 
   mode = static_cast<uint8_t>(parsed);
   return true;
+}
+
+bool AutonomousPoller::parseControllerEpoch(const char *payload,
+                                            uint32_t &epoch) {
+  if (payload == nullptr) {
+    return false;
+  }
+
+  const char *marker = strstr(payload, "T=");
+  if (marker == nullptr) {
+    return false;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long parsed = strtoul(marker + 2, &end, 10);
+  if (errno != 0 || end == marker + 2) {
+    return false;
+  }
+
+  epoch = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+uint32_t AutonomousPoller::epochDifference(uint32_t first,
+                                           uint32_t second) {
+  return first >= second ? first - second : second - first;
 }

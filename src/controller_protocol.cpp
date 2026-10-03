@@ -137,4 +137,80 @@ bool parseResponseFrame(const uint8_t *frame, size_t frameLength,
   return receivedChecksum == checksum(payload, payloadLength);
 }
 
+bool parseModePayloadWithDamagedHeader(const uint8_t *frame,
+                                       size_t frameLength,
+                                       const uint8_t *&payload,
+                                       size_t &payloadLength) {
+  constexpr size_t kTrailerLength = 5;
+  constexpr size_t kHeaderSearchLimit = 8;
+
+  payload = nullptr;
+  payloadLength = 0;
+  if (frame == nullptr || frameLength < 1 + kTrailerLength) {
+    return false;
+  }
+
+  const size_t checksumIndex = frameLength - kTrailerLength;
+  if (frame[checksumIndex] != '*' ||
+      !std::isxdigit(frame[checksumIndex + 1]) ||
+      !std::isxdigit(frame[checksumIndex + 2]) ||
+      frame[checksumIndex + 3] != '\r' || frame[checksumIndex + 4] != '\n') {
+    return false;
+  }
+
+  size_t hashIndex = 0;
+  bool hashFound = false;
+  const size_t searchEnd =
+      checksumIndex < kHeaderSearchLimit ? checksumIndex : kHeaderSearchLimit;
+  for (; hashIndex < searchEnd; ++hashIndex) {
+    if (frame[hashIndex] == '#') {
+      hashFound = true;
+      break;
+    }
+  }
+  if (!hashFound || hashIndex + 1 >= checksumIndex) {
+    return false;
+  }
+
+  payload = frame + hashIndex + 1;
+  payloadLength = checksumIndex - hashIndex - 1;
+  const uint8_t receivedChecksum =
+      decodeHexByte(frame[checksumIndex + 1], frame[checksumIndex + 2]);
+  if (receivedChecksum != checksum(payload, payloadLength)) {
+    payload = nullptr;
+    payloadLength = 0;
+    return false;
+  }
+
+  size_t modeIndex = 0;
+  while (modeIndex < payloadLength &&
+         (payload[modeIndex] == '\r' || payload[modeIndex] == '\n')) {
+    ++modeIndex;
+  }
+  const bool isModeQueryPayload =
+      modeIndex + 2 < payloadLength &&
+      std::toupper(static_cast<unsigned char>(payload[modeIndex])) == 'R' &&
+      payload[modeIndex + 1] == '=' &&
+      std::isdigit(static_cast<unsigned char>(payload[modeIndex + 2]));
+
+  constexpr char kNormalModeText[] = "OPM_NORMAL";
+  bool isNormalModeAcknowledgement = false;
+  for (size_t index = modeIndex;
+       index + sizeof(kNormalModeText) - 1 <= payloadLength; ++index) {
+    if (memcmp(payload + index, kNormalModeText,
+               sizeof(kNormalModeText) - 1) == 0) {
+      isNormalModeAcknowledgement = true;
+      break;
+    }
+  }
+
+  if (!isModeQueryPayload && !isNormalModeAcknowledgement) {
+    payload = nullptr;
+    payloadLength = 0;
+    return false;
+  }
+
+  return true;
+}
+
 }  // namespace ControllerProtocol

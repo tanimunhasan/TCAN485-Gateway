@@ -59,9 +59,21 @@ void ControllerCommandSender::completeResponse(const uint8_t *frame,
                                                 bool overflowed) {
   const uint8_t *payload = nullptr;
   size_t payloadLength = 0;
-  if (awaitingResponse_ && !overflowed &&
-      ControllerProtocol::parseResponseFrame(
-          frame, frameLength, destinationAddress_, payload, payloadLength)) {
+  bool parsed = false;
+  if (awaitingResponse_ && !overflowed) {
+    parsed = ControllerProtocol::parseResponseFrame(
+        frame, frameLength, destinationAddress_, payload, payloadLength);
+    if (!parsed && activeCommandCode_ == 'R' &&
+        ControllerProtocol::parseModePayloadWithDamagedHeader(
+            frame, frameLength, payload, payloadLength)) {
+      parsed = true;
+      Serial.println(
+          "RS485 warning: recovered checksum-valid R command payload from a "
+          "damaged response header.");
+    }
+  }
+
+  if (parsed) {
     const size_t copyLength =
         std::min(payloadLength, sizeof(completedPayload_) - 1);
     memcpy(completedPayload_, payload, copyLength);

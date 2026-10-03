@@ -22,5 +22,9 @@ bool buildFrame(uint8_t address, const char *command, char *frame,
 bool parseResponseFrame(const uint8_t *frame, size_t frameLength,
                         uint8_t expectedAddress, const uint8_t *&payload,
                         size_t &payloadLength);
+bool parseModePayloadWithDamagedHeader(const uint8_t *frame,
+                                       size_t frameLength,
+                                       const uint8_t *&payload,
+                                       size_t &payloadLength);
 
 }  // namespace ControllerProtocol

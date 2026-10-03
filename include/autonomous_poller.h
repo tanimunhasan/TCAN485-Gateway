@@ -18,12 +18,13 @@ class AutonomousPoller {
   enum class ControllerState {
     NeedModeQuery,
     WaitModeQuery,
-    NeedSetNormal,
     WaitSetNormal,
     NeedModeConfirmation,
     WaitModeConfirmation,
     NeedTimeSync,
     WaitTimeSync,
+    NeedTimeConfirmation,
+    WaitTimeConfirmation,
     RetryDelay,
     Ready,
   };
@@ -35,16 +36,19 @@ class AutonomousPoller {
   };
 
   void printWaitReason(WaitReason reason);
-  void beginModeAudit(uint32_t now, const char *reason);
+  void beginHealthCheck(uint32_t now, const char *reason);
   void serviceControllerManagement(uint32_t now);
-  void handleModeAuditFailure(uint32_t now, const char *reason);
+  void handleHealthCheckFailure(uint32_t now, const char *reason);
   void handleTimeSyncFailure(uint32_t now, const char *reason);
-  void finishModeAudit(uint32_t now);
+  void finishHealthCheck(uint32_t now);
+  void finishTimeCheck(uint32_t now);
   void completeStartup(uint32_t now);
   void serviceLogPolling(uint32_t now);
   void handleLogFailure(uint32_t now, const char *reason);
   bool responseTimedOut(uint32_t now) const;
   static bool parseOperationMode(const char *payload, uint8_t &mode);
+  static bool parseControllerEpoch(const char *payload, uint32_t &epoch);
+  static uint32_t epochDifference(uint32_t first, uint32_t second);
 
   ControllerCommandSender &controller_;
   const WifiManager &wifi_;
@@ -55,14 +59,14 @@ class AutonomousPoller {
   ControllerState controllerState_{ControllerState::NeedModeQuery};
   ControllerState retryState_{ControllerState::NeedModeQuery};
   uint32_t controllerStateStartedMs_{0};
-  uint32_t lastModeAuditMs_{0};
-  uint32_t modeAuditIntervalMs_{0};
+  uint32_t lastHealthCheckMs_{0};
+  uint32_t healthCheckIntervalMs_{0};
   uint32_t lastTimeSyncFailureMs_{0};
-  uint8_t modeAuditAttempts_{0};
+  uint8_t healthCheckAttempts_{0};
   uint8_t consecutiveLogFailures_{0};
-  bool modeAuditInProgress_{true};
+  bool healthCheckInProgress_{true};
   bool modeConfirmedNormal_{false};
-  bool timeSyncDue_{true};
+  bool timeSyncDue_{false};
   bool timeSyncBackoffActive_{false};
   bool startupComplete_{false};
   bool logRequestPending_{false};

@@ -207,15 +207,18 @@ Upload:
 ```
 
 The autonomous build treats `R=3` (`OPM_NORMAL`) as the required production
-controller mode. Its startup supervision sequence is:
+controller mode. Its startup and one-minute health-check sequence is:
 
 1. Send `R=?` and validate the addressed RS485 response and checksum.
 2. If the controller reports `R=3`, leave the running BabyBear, MummyBear, or
-   DaddyBear profile untouched.
+   DaddyBear profile and controller UTC untouched. The health check ends
+   without sending either `T=?` or `T=<epoch>`.
 3. If the controller reports any other mode, including `R=0` (hibernate) or
-   `R=4` (test), send `R=3` once.
+   `R=4` (test), immediately send `R=3` in the same health-check pass.
 4. Send `R=?` again and require confirmation of `R=3`.
-5. Once NTP UTC is valid, send `T=<epoch>` to set the controller RTC.
+5. After that mode recovery, once NTP UTC is valid, send a fresh
+   `T=<epoch>`, then send `T=?` and require confirmation. If NTP is not ready,
+   retain the UTC update as pending and perform it when valid UTC is available.
 6. Start periodic Manga log polling with a fixed `L=6h` request every ten
    minutes. This requests up to six unread records in hexadecimal format.
 
@@ -225,19 +228,30 @@ Only valid `L=` response frames are eligible for legacy UDP formatting.
 Unsolicited RS485 bytes received while no controller command is pending are
 discarded silently and never passed to the cloud formatter.
 
-The production-mode audit repeats every 24 hours. It always queries `R=?`
-first and only sends `R=3` when the reported mode is not already normal. This
-avoids disturbing a controller that is independently running its selected gas
-cycle profile while still forcing test or hibernate modes back to production.
+A waking hibernating controller can occasionally corrupt the response's
+leading `@AA` bytes while leaving `#<payload>*CC\r\n` intact. Only for a
+solicited `R` transaction, the gateway can recover a checksum-valid payload
+that contains either `R=<mode>` or the expected `OPM_NORMAL` acknowledgement.
+Address validation remains mandatory for normal responses, and this recovery
+is never used for `L=` data forwarded to the cloud.
 
-Startup cannot block forever waiting for the controller. A mode audit gets
+The production health check repeats every minute. It always queries `R=?`
+first and only sends `R=3` when the reported mode is not already normal. It
+does not query or write UTC while `R=3` is already active. UTC is written and
+verified only after the gateway recovers the controller from another mode.
+This avoids restarting or otherwise disturbing a controller that is
+independently running its selected gas-cycle profile, while still recovering
+quickly from a reset, hibernate mode, or test mode and replacing the reset RTC.
+
+Startup cannot block forever waiting for the controller. A health check gets
 three attempts with the configured response timeout and retry delay. If all
-attempts fail, log polling continues in degraded mode and the audit retries
-after five minutes. UTC synchronization failures also retry in the background.
+attempts fail, log polling continues in degraded mode and the health check
+retries after one minute. UTC write or confirmation failures also retry
+without blocking the ten-minute log-poll schedule indefinitely.
 
 After two consecutive invalid or timed-out `L=` responses, the ESP32 starts a
-new `R=?` mode audit; it does not blindly send `R=3`. It continues using the
-same fixed `L=6h` request after recovery.
+new health check beginning with `R=?`; it does not blindly send `R=3`. It
+continues using the same fixed `L=6h` request after recovery.
 
 The defaults in `include/autonomous_config.h` are:
 
@@ -247,9 +261,11 @@ The defaults in `include/autonomous_config.h` are:
 #define AUTONOMOUS_LOG_PAGE_SIZE 6
 #define AUTONOMOUS_CONTROLLER_RETRY_MS 5000UL
 #define AUTONOMOUS_CONTROLLER_MAX_ATTEMPTS 3
-#define AUTONOMOUS_MODE_AUDIT_INTERVAL_MS 86400000UL
-#define AUTONOMOUS_DEGRADED_RETRY_MS 300000UL
+#define AUTONOMOUS_HEALTH_CHECK_INTERVAL_MS 60000UL
+#define AUTONOMOUS_DEGRADED_RETRY_MS 60000UL
 #define AUTONOMOUS_LOG_FAILURES_BEFORE_AUDIT 2
+#define AUTONOMOUS_MIN_VALID_EPOCH 1704067200UL
+#define AUTONOMOUS_TIME_DRIFT_TOLERANCE_SEC 30UL
 ```
 
 Override an autonomous build setting in `platformio.ini`:
