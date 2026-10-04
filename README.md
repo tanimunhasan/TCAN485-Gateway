@@ -5,6 +5,8 @@ This PlatformIO firmware runs on a LilyGo T-CAN485 / ESP32 board. It provides:
 - A USB serial terminal for manual RS485 controller commands.
 - RS485 communication at 9600 baud, 8N1.
 - Wi-Fi station connection with automatic reconnect.
+- Optional remote firmware updates and gateway health through mDash in the
+  autonomous build.
 - UDP forwarding to Node-RED.
 - Legacy NB-IoT-compatible Manga/Sentinel-AURA packet formatting.
 - A build-selected autonomous mode for periodic Manga log polling.
@@ -88,6 +90,49 @@ constexpr char kPassword[] = "YOUR_WIFI_PASSWORD";
 ```
 
 The serial terminal prints the assigned IP address after a successful connection.
+
+### mDash OTA credentials
+
+Register the gateway as a device at [mDash](https://mdash.net). Copy
+`include/mdash_credentials.example.h` to `include/mdash_credentials.h`, then
+paste only that device's unique password into the copied file:
+
+```cpp
+namespace MDashCredentials {
+constexpr bool kEnabled = true;
+constexpr char kDevicePassword[] = "YOUR_MDASH_DEVICE_PASSWORD";
+}
+```
+
+The real credentials file is ignored by Git. Do not use an mDash account
+login, master API key, or public API key here, and do not commit the device
+password. Set `kEnabled` to `false` to keep the mDash client inactive.
+
+The board must receive this OTA-capable firmware once over USB. After it comes
+online in mDash, build and upload the autonomous application binary from the
+device dashboard:
+
+```text
+.pio/build/esp32dev-autonomous/firmware.bin
+```
+
+The existing ESP32 default partition table is retained. It provides two OTA
+application slots; every future OTA image must fit in one slot.
+
+mDash is a separate management plane. It does not replace or alter the
+Node-RED UDP telemetry path and it cannot submit arbitrary RS485 commands.
+The firmware publishes a read-only `state.reported.gateway` health object once
+per minute while connected. It includes firmware version, uptime, free heap,
+Wi-Fi state/RSSI/IP, NTP state, run mode, the most recently confirmed
+controller mode, controller health-check status/times, the last successful
+log-response times, and the consecutive log-failure count. Desired-shadow
+values are not consumed by this firmware.
+
+This initial bench implementation uses the standard mDash OTA mechanism over
+its authenticated TLS connection. It does not add application-level firmware
+signature verification, Secure Boot, flash encryption, automatic rollback
+health validation, or staged fleet deployment. Add those controls before a
+production rollout whose threat model or availability requirements need them.
 
 ### Node-RED UDP destination
 
@@ -263,6 +308,8 @@ Successful legacy telemetry begins with a value similar to:
 | `src/controller_protocol.cpp` | Controller command catalogue and checksum/frame construction |
 | `src/terminal.cpp` | USB terminal, manual commands, receive buffering, and diagnostics |
 | `src/wifi_manager.cpp` | Wi-Fi station connection and reconnect behavior |
+| `src/mdash_manager.cpp` | Non-blocking mDash startup, OTA, and reported health |
+| `include/firmware_version.h` | Application firmware version reported to mDash |
 | `src/clock_service.cpp` | NTP UTC synchronization |
 | `src/legacy_uplink_formatter.cpp` | RS485 Manga-page parsing and legacy packet formatting |
 | `src/udp_forwarder.cpp` | UDP datagram transmission |

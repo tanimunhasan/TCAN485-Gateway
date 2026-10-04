@@ -171,6 +171,7 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
       }
       if (mode == 3) {
         modeConfirmedNormal_ = true;
+        lastControllerModeConfirmedR3_ = true;
         if (timeSyncDue_) {
           Serial.println(
               "Controller confirmed R=3 after mode recovery; UTC update is "
@@ -180,15 +181,16 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
           } else {
             Serial.println(
                 "Controller UTC update is pending until ESP32 NTP is valid.");
-            finishHealthCheck(now);
+            finishHealthCheck(now, true);
           }
         } else {
           Serial.println(
               "Controller confirmed R=3 - OPM_NORMAL; mode and UTC "
               "unchanged.");
-          finishHealthCheck(now);
+          finishHealthCheck(now, true);
         }
       } else {
+        lastControllerModeConfirmedR3_ = false;
         Serial.printf(
             "Controller reported R=%u; immediately sending R=3.\n",
             mode);
@@ -237,7 +239,13 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
       if (!controller_.takeCompletedResponse(
               'R', payload, sizeof(payload), payloadLength,
               payloadTruncated) ||
-          payloadTruncated || !parseOperationMode(payload, mode) || mode != 3) {
+          payloadTruncated || !parseOperationMode(payload, mode)) {
+        handleHealthCheckFailure(now,
+                                 "controller did not confirm OPM_NORMAL");
+        return;
+      }
+      lastControllerModeConfirmedR3_ = mode == 3;
+      if (mode != 3) {
         handleHealthCheckFailure(now,
                                  "controller did not confirm OPM_NORMAL");
         return;
@@ -250,14 +258,14 @@ void AutonomousPoller::serviceControllerManagement(uint32_t now) {
       } else {
         Serial.println(
             "Controller UTC update is pending until ESP32 NTP is valid.");
-        finishHealthCheck(now);
+        finishHealthCheck(now, true);
       }
       return;
 
     case ControllerState::NeedTimeSync: {
       if (!clock_.hasValidTime()) {
         if (healthCheckInProgress_) {
-          finishHealthCheck(now);
+          finishHealthCheck(now, true);
         } else {
           controllerState_ = ControllerState::Ready;
         }
@@ -369,6 +377,7 @@ void AutonomousPoller::handleHealthCheckFailure(uint32_t now,
       kControllerMaxAttempts, reason,
       static_cast<unsigned long>(kDegradedRetryMs / 1000UL));
   modeConfirmedNormal_ = false;
+  recordHealthCheckResult(now, false);
   healthCheckInProgress_ = false;
   controllerState_ = ControllerState::Ready;
   lastHealthCheckMs_ = now;
@@ -386,13 +395,14 @@ void AutonomousPoller::handleTimeSyncFailure(uint32_t now,
   timeSyncBackoffActive_ = true;
   lastTimeSyncFailureMs_ = now;
   if (healthCheckInProgress_) {
-    finishHealthCheck(now);
+    finishHealthCheck(now, false);
   } else {
     controllerState_ = ControllerState::Ready;
   }
 }
 
-void AutonomousPoller::finishHealthCheck(uint32_t now) {
+void AutonomousPoller::finishHealthCheck(uint32_t now, bool successful) {
+  recordHealthCheckResult(now, successful);
   controllerState_ = ControllerState::Ready;
   healthCheckInProgress_ = false;
   healthCheckAttempts_ = 0;
@@ -404,10 +414,18 @@ void AutonomousPoller::finishHealthCheck(uint32_t now) {
 
 void AutonomousPoller::finishTimeCheck(uint32_t now) {
   if (healthCheckInProgress_) {
-    finishHealthCheck(now);
+    finishHealthCheck(now, true);
   } else {
     controllerState_ = ControllerState::Ready;
   }
+}
+
+void AutonomousPoller::recordHealthCheckResult(uint32_t now,
+                                               bool successful) {
+  hasHealthCheckResult_ = true;
+  lastHealthCheckPassed_ = successful;
+  lastHealthCheckResultAtMs_ = now;
+  lastHealthCheckEpoch_ = clock_.hasValidTime() ? clock_.epoch() : 0;
 }
 
 void AutonomousPoller::completeStartup(uint32_t now) {
@@ -439,6 +457,10 @@ void AutonomousPoller::serviceLogPolling(uint32_t now) {
     }
 
     consecutiveLogFailures_ = 0;
+    hasSuccessfulLogResponse_ = true;
+    lastSuccessfulLogResponseAtMs_ = now;
+    lastSuccessfulLogResponseEpoch_ =
+        clock_.hasValidTime() ? clock_.epoch() : 0;
     return;
   }
 
@@ -453,6 +475,45 @@ void AutonomousPoller::serviceLogPolling(uint32_t now) {
     logRequestPending_ = true;
     lastDispatchMs_ = now;
   }
+}
+
+bool AutonomousPoller::lastControllerModeConfirmedR3() const {
+  return lastControllerModeConfirmedR3_;
+}
+
+bool AutonomousPoller::controllerResponsePending() const {
+  return controller_.isAwaitingResponse();
+}
+
+const char *AutonomousPoller::lastHealthCheckResult() const {
+  if (!hasHealthCheckResult_) {
+    return "never";
+  }
+  return lastHealthCheckPassed_ ? "passed" : "failed";
+}
+
+uint32_t AutonomousPoller::lastHealthCheckAtMs() const {
+  return lastHealthCheckResultAtMs_;
+}
+
+uint32_t AutonomousPoller::lastHealthCheckEpoch() const {
+  return lastHealthCheckEpoch_;
+}
+
+bool AutonomousPoller::hasSuccessfulLogResponse() const {
+  return hasSuccessfulLogResponse_;
+}
+
+uint32_t AutonomousPoller::lastSuccessfulLogResponseAtMs() const {
+  return lastSuccessfulLogResponseAtMs_;
+}
+
+uint32_t AutonomousPoller::lastSuccessfulLogResponseEpoch() const {
+  return lastSuccessfulLogResponseEpoch_;
+}
+
+uint8_t AutonomousPoller::consecutiveLogFailures() const {
+  return consecutiveLogFailures_;
 }
 
 void AutonomousPoller::handleLogFailure(uint32_t now, const char *reason) {

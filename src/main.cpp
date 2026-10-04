@@ -5,6 +5,7 @@
 #include "controller_command_sender.h"
 #include "firmware_mode.h"
 #include "legacy_uplink_formatter.h"
+#include "mdash_manager.h"
 #include "rs485_transport.h"
 #include "terminal.h"
 #include "udp_forwarder.h"
@@ -21,6 +22,7 @@ LegacyUplinkFormatter legacyFormatter(wifi, gatewayClock);
 Terminal terminal(rs485, controller, udpForwarder, legacyFormatter);
 #if FIRMWARE_RUN_MODE == FIRMWARE_MODE_AUTONOMOUS
 AutonomousPoller autonomousPoller(controller, wifi, gatewayClock);
+MDashManager mdash(wifi, gatewayClock, autonomousPoller);
 #endif
 
 }  // namespace
@@ -33,6 +35,7 @@ void setup() {
   legacyFormatter.begin();
 #if FIRMWARE_RUN_MODE == FIRMWARE_MODE_AUTONOMOUS
   autonomousPoller.begin();
+  mdash.begin();
 #else
   Serial.println("Firmware mode: manual terminal.");
 #endif
@@ -44,5 +47,6 @@ void loop() {
   terminal.service();
 #if FIRMWARE_RUN_MODE == FIRMWARE_MODE_AUTONOMOUS
   autonomousPoller.service();
+  mdash.service();
 #endif
 }

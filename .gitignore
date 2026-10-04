@@ -6,3 +6,4 @@
 include/wifi_credentials.h
 include/udp_config.h
 include/legacy_uplink_config.h
+include/mdash_credentials.h

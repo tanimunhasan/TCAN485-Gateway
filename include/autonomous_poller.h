@@ -14,6 +14,16 @@ class AutonomousPoller {
   void begin();
   void service();
 
+  bool lastControllerModeConfirmedR3() const;
+  bool controllerResponsePending() const;
+  const char *lastHealthCheckResult() const;
+  uint32_t lastHealthCheckAtMs() const;
+  uint32_t lastHealthCheckEpoch() const;
+  bool hasSuccessfulLogResponse() const;
+  uint32_t lastSuccessfulLogResponseAtMs() const;
+  uint32_t lastSuccessfulLogResponseEpoch() const;
+  uint8_t consecutiveLogFailures() const;
+
  private:
   enum class ControllerState {
     NeedModeQuery,
@@ -40,8 +50,9 @@ class AutonomousPoller {
   void serviceControllerManagement(uint32_t now);
   void handleHealthCheckFailure(uint32_t now, const char *reason);
   void handleTimeSyncFailure(uint32_t now, const char *reason);
-  void finishHealthCheck(uint32_t now);
+  void finishHealthCheck(uint32_t now, bool successful);
   void finishTimeCheck(uint32_t now);
+  void recordHealthCheckResult(uint32_t now, bool successful);
   void completeStartup(uint32_t now);
   void serviceLogPolling(uint32_t now);
   void handleLogFailure(uint32_t now, const char *reason);
@@ -66,6 +77,14 @@ class AutonomousPoller {
   uint8_t consecutiveLogFailures_{0};
   bool healthCheckInProgress_{true};
   bool modeConfirmedNormal_{false};
+  bool lastControllerModeConfirmedR3_{false};
+  bool hasHealthCheckResult_{false};
+  bool lastHealthCheckPassed_{false};
+  uint32_t lastHealthCheckResultAtMs_{0};
+  uint32_t lastHealthCheckEpoch_{0};
+  bool hasSuccessfulLogResponse_{false};
+  uint32_t lastSuccessfulLogResponseAtMs_{0};
+  uint32_t lastSuccessfulLogResponseEpoch_{0};
   bool timeSyncDue_{false};
   bool timeSyncBackoffActive_{false};
   bool startupComplete_{false};
